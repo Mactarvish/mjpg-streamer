@@ -1,0 +1,1 @@
+rsync -avz cmake-build-aarch64-release/install orangepi@192.168.8.13:/home/orangepi/github/mjpg-streamer/

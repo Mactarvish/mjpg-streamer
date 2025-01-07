@@ -24,9 +24,13 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
-#include "input_opencv.h"
+#include "input_ros2.h"
 
 #include "opencv2/opencv.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <cv_bridge/cv_bridge.h>
+#include "std_msgs/msg/string.hpp"
 
 using namespace cv;
 using namespace std;
@@ -54,8 +58,7 @@ typedef void (*filter_free_fn)(void* filter_ctx);
 
 typedef struct {
     pthread_t   worker;
-    VideoCapture capture;
-    
+
     context_settings *init_settings;
     
     void* filter_handle;
@@ -132,6 +135,67 @@ Description.: parse input parameters
 Input Value.: param contains the command line string and a pointer to globals
 Return Value: 0 if everything is ok
 ******************************************************************************/
+
+class ROS2PublishToMjpgStreamerInputConverter : public rclcpp::Node
+{
+public:
+    explicit ROS2PublishToMjpgStreamerInputConverter(input* in) : Node("ros2_publish_to_mjpg_streamer_input_converter"), in(in)
+    {
+        // 声明参数
+        this->declare_parameter<std::string>("topic_name", "/image_raw");
+
+        // 创建参数回调
+        parameter_callback_handle_ = this->add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter> &parameters) {
+                for (const auto &param : parameters) {
+                    if (param.get_name() == "topic_name") {
+                        this->update_subscription(param.as_string());
+                    }
+                }
+                rcl_interfaces::msg::SetParametersResult result;
+                result.successful = true;
+                return result;
+            });
+
+        // 初始化订阅
+        auto initial_topic = this->get_parameter("topic_name").as_string();
+        this->update_subscription(initial_topic);
+    }
+
+    void ImageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+    {
+        // IPRINT("Image received.\n");
+        cv::Mat src = cv_bridge::toCvShare(msg, "bgr8")->image;
+        /* copy JPG picture to global buffer */
+        pthread_mutex_lock(&in->db);
+        vector<uchar> jpeg_buffer;
+        // take whatever Mat it returns, and write it to jpeg buffer
+        // imencode(".jpg", src, jpeg_buffer, compression_params);
+        imencode(".jpg", src, jpeg_buffer);
+
+        // std::vector is guaranteed to be contiguous
+        in->buf = &jpeg_buffer[0];
+        in->size = jpeg_buffer.size();
+
+        /* signal fresh_frame */
+        pthread_cond_broadcast(&in->db_update);
+        pthread_mutex_unlock(&in->db);
+    }
+
+private:
+    void update_subscription(const std::string &new_topic) {
+        RCLCPP_INFO(this->get_logger(), "Switching subscription to topic: %s", new_topic.c_str());
+        // 销毁旧订阅器（如果存在）
+        subscriber.reset();
+        // 创建新订阅器
+        subscriber = this->create_subscription<sensor_msgs::msg::Image>(
+            new_topic, 10, std::bind(&ROS2PublishToMjpgStreamerInputConverter::ImageCallback, this, std::placeholders::_1));
+    }
+
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscriber;
+    input* in;
+};
 
 
 int input_init(input_parameter *param, int plugin_no)
@@ -252,32 +316,6 @@ int input_init(input_parameter *param, int plugin_no)
     IPRINT("device........... : %s\n", device);
     IPRINT("Desired Resolution: %i x %i\n", width, height);
     
-    // need to allocate a VideoCapture object: default device is 0
-    try {
-        if (!strcasecmp(device, "default")) {
-            pctx->capture.open(0);
-        } else if (sscanf(device, "%d", &device_idx) == 1) {
-            pctx->capture.open(device_idx);
-        } else {
-            pctx->capture.open(device);
-        }
-    } catch (Exception e) {
-        IPRINT("VideoCapture::open() failed: %s\n", e.what());
-        goto fatal_error;
-    }
-    
-    // validate that isOpened is true
-    if (!pctx->capture.isOpened()) {
-        IPRINT("VideoCapture::open() failed\n");
-        goto fatal_error;
-    }
-    
-    pctx->capture.set(CAP_PROP_FRAME_WIDTH, width);
-    pctx->capture.set(CAP_PROP_FRAME_HEIGHT, height);
-    
-    if (settings->fps_set)
-        pctx->capture.set(CAP_PROP_FPS, settings->fps);
-    
     /* filter stuff goes here */
     if (filter != NULL) {
         
@@ -383,25 +421,10 @@ void *worker_thread(void *arg)
     /* set cleanup handler to cleanup allocated resources */
     pthread_cleanup_push(worker_cleanup, arg);
 
-    /* set VideoCapture options */
-    #define CVOPT_OPT(prop, var, desc) \
-        if (!pctx->capture.set(prop, settings->var)) {\
-            IPRINT("%-18s: %d\n", desc, settings->var); \
-        } else {\
-            fprintf(stderr, "Failed to set " desc "\n"); \
-        }
-    
     #define CVOPT_SET(prop, var, desc) \
         if (settings->var##_set) { \
             CVOPT_OPT(prop, var,desc) \
         }
-    
-    CVOPT_SET(CAP_PROP_FPS, fps, "frames per second")
-    CVOPT_SET(CAP_PROP_BRIGHTNESS, co, "contrast")
-    CVOPT_SET(CAP_PROP_CONTRAST, br, "brightness")
-    CVOPT_SET(CAP_PROP_SATURATION, sa, "saturation")
-    CVOPT_SET(CAP_PROP_GAIN, gain, "gain")
-    CVOPT_SET(CAP_PROP_EXPOSURE, ex, "exposure")
     
     /* setup imencode options */
     vector<int> compression_params;
@@ -414,36 +437,17 @@ void *worker_thread(void *arg)
     
     Mat src, dst;
     vector<uchar> jpeg_buffer;
-    
+
     // this exists so that the numpy allocator can assign a custom allocator to
     // the mat, so that it doesn't need to copy the data each time
-    if (pctx->filter_init_frame != NULL)
-        src = pctx->filter_init_frame(pctx->filter_ctx);
-    
-    while (!pglobal->stop) {
-        if (!pctx->capture.read(src))
-            break; // TODO
-            
-        // call the filter function
-        pctx->filter_process(pctx->filter_ctx, src, dst);
-            
-        /* copy JPG picture to global buffer */
-        pthread_mutex_lock(&in->db);
-        
-        // take whatever Mat it returns, and write it to jpeg buffer
-        imencode(".jpg", dst, jpeg_buffer, compression_params);
-        
-        // TODO: what to do if imencode returns an error?
-        
-        // std::vector is guaranteed to be contiguous
-        in->buf = &jpeg_buffer[0];
-        in->size = jpeg_buffer.size();
-        
-        /* signal fresh_frame */
-        pthread_cond_broadcast(&in->db_update);
-        pthread_mutex_unlock(&in->db);
-    }
-    
+    // if (pctx->filter_init_frame != NULL)
+    //     src = pctx->filter_init_frame(pctx->filter_ctx);
+
+    IPRINT("Constructing ros2 node ...\n");
+    rclcpp::init(0, nullptr);
+    rclcpp::spin(std::make_shared<ROS2PublishToMjpgStreamerInputConverter>(in));
+    rclcpp::shutdown();
+
     IPRINT("leaving input thread, calling cleanup function now\n");
     pthread_cleanup_pop(1);
 

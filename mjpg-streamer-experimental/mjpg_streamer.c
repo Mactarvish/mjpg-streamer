@@ -102,6 +102,7 @@ static void signal_handler(int sig)
     /* clean up threads */
     LOG("force cancellation of threads and cleanup resources\n");
     for(i = 0; i < global.incnt; i++) {
+        // 调用动态库的stop函数
         global.in[i].stop(i);
         /*for (j = 0; j<MAX_PLUGIN_ARGUMENTS; j++) {
             if (global.in[i].param.argv[j] != NULL) {
@@ -305,6 +306,7 @@ int main(int argc, char *argv[])
         global.in[i].buf       = NULL;
         global.in[i].size      = 0;
         global.in[i].plugin = (tmp > 0) ? strndup(input[i], tmp) : strdup(input[i]);
+        // 动态加载动态链接库
         global.in[i].handle = dlopen(global.in[i].plugin, RTLD_LAZY);
         if(!global.in[i].handle) {
             LOG("ERROR: could not find input plugin\n");
@@ -314,6 +316,7 @@ int main(int argc, char *argv[])
             closelog();
             exit(EXIT_FAILURE);
         }
+        // 获取动态库中的函数指针
         global.in[i].init = dlsym(global.in[i].handle, "input_init");
         if(global.in[i].init == NULL) {
             LOG("%s\n", dlerror());
@@ -342,6 +345,7 @@ int main(int argc, char *argv[])
         global.in[i].param.global = &global;
         global.in[i].param.id = i;
 
+        // 执行动态库的init函数
         if(global.in[i].init(&global.in[i].param, i)) {
             LOG("input_init() return value signals to exit\n");
             closelog();
@@ -401,6 +405,7 @@ int main(int argc, char *argv[])
     DBG("starting %d input plugin\n", global.incnt);
     for(i = 0; i < global.incnt; i++) {
         syslog(LOG_INFO, "starting input plugin %s", global.in[i].plugin);
+        // 执行动态库的run函数
         if(global.in[i].run(i)) {
             LOG("can not run input plugin %d: %s\n", i, global.in[i].plugin);
             closelog();
